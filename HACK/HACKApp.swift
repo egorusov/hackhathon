@@ -11,7 +11,9 @@ import SwiftUI
 struct HACKApp: App {
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            BugReportCaptureLayer {
+                ContentView()
+            }
         }
     }
 }
