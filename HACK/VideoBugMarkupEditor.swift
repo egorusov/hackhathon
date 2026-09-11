@@ -89,21 +89,33 @@ struct VideoBugMarkupEditor: View {
                 ToolbarItem(placement: .topBarLeading) {
                     Button(action: requestClose) {
                         Image(systemName: "xmark")
+                            .font(.body.weight(.semibold))
                             .frame(width: 44, height: 44)
+                            .background(.regularMaterial, in: Circle())
+                            .contentShape(Circle())
                     }
+                    .buttonStyle(.plain)
                     .disabled(isRendering)
                     .accessibilityLabel("Закрыть")
                 }
 
                 ToolbarItem(placement: .topBarTrailing) {
                     Button(action: renderAnnotations) {
-                        if isRendering {
-                            ProgressView()
-                        } else {
-                            Text("Готово")
+                        Group {
+                            if isRendering {
+                                ProgressView()
+                                    .tint(.white)
+                            } else {
+                                Text("Готово")
+                            }
                         }
+                        .frame(minWidth: 58, minHeight: 32)
+                        .foregroundStyle(Color.white)
                     }
                     .fontWeight(.semibold)
+                    .buttonStyle(.borderedProminent)
+                    .buttonBorderShape(.capsule)
+                    .tint(.blue)
                     .disabled(!playback.isReady || canvasSize.width <= 0 || isRendering)
                     .accessibilityHint("Создает снимки отмеченных кадров и открывает форму баг-репорта")
                 }
@@ -197,7 +209,7 @@ struct VideoBugMarkupEditor: View {
                     Image(systemName: "trash")
                         .frame(width: 44, height: 44)
                 }
-                .disabled(!canEditDrawing)
+                .disabled(selectedMarkerID == nil)
                 .accessibilityLabel("Удалить выбранный маркер")
             }
             .padding(.horizontal, 12)
@@ -233,7 +245,7 @@ struct VideoBugMarkupEditor: View {
                 VStack {
                     Spacer()
 
-                    Label("Добавьте кадр, чтобы рисовать", systemImage: "plus.circle.fill")
+                    Label("Остановите видео, чтобы рисовать", systemImage: "pause.circle.fill")
                         .font(.footnote.weight(.semibold))
                         .foregroundStyle(.white)
                         .padding(.horizontal, 12)
@@ -259,7 +271,7 @@ struct VideoBugMarkupEditor: View {
     private var timelineControls: some View {
         VStack(spacing: 10) {
             HStack {
-                Label("\(markers.count) \(markerCountWord)", systemImage: "rectangle.stack")
+                Label("\(markers.count) \(markerCountWord)", systemImage: "pencil.and.outline")
                     .font(.headline)
 
                 Spacer()
@@ -288,43 +300,6 @@ struct VideoBugMarkupEditor: View {
 
                 markerTimeline
             }
-
-            HStack(spacing: 10) {
-                Button {
-                    stepPlayhead(by: -1)
-                } label: {
-                    Image(systemName: "chevron.left")
-                        .frame(width: 44, height: 44)
-                }
-                .buttonStyle(.bordered)
-                .disabled(!playback.isReady || playback.currentTime <= 0)
-                .accessibilityLabel("Предыдущий кадр")
-
-                Button {
-                    stepPlayhead(by: 1)
-                } label: {
-                    Image(systemName: "chevron.right")
-                        .frame(width: 44, height: 44)
-                }
-                .buttonStyle(.bordered)
-                .disabled(!playback.isReady || playback.currentTime >= playback.lastFrameTime)
-                .accessibilityLabel("Следующий кадр")
-
-                Spacer(minLength: 0)
-
-                Button(action: addMarkerAtPlayhead) {
-                    Label("Кадр", systemImage: "plus.rectangle.on.rectangle")
-                        .frame(minHeight: 44)
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(!playback.isReady)
-                .accessibilityHint("Добавляет маркер на текущем кадре для рисования")
-            }
-
-            Text(canEditDrawing ? "Пометка появится в видео на 1,2 секунды." : "Проведите по ленте или переключайте видео покадрово.")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
 
             if !markers.isEmpty {
                 markerChips
@@ -434,7 +409,7 @@ struct VideoBugMarkupEditor: View {
                         )
                     }
                     .buttonStyle(.plain)
-                    .accessibilityLabel("Кадр \(index + 1), \(formattedTime(marker.time))")
+                    .accessibilityLabel("Пометка \(index + 1), \(formattedTime(marker.time))")
                     .accessibilityAddTraits(selectedMarkerID == marker.id ? .isSelected : [])
                 }
             }
@@ -446,17 +421,17 @@ struct VideoBugMarkupEditor: View {
     }
 
     private var canEditDrawing: Bool {
-        selectedMarkerID != nil
+        playback.isReady && !playback.isPlaying
     }
 
     private var markerCountWord: String {
         let value = markers.count % 100
-        if (11...14).contains(value) { return "кадров" }
+        if (11...14).contains(value) { return "пометок" }
 
         switch markers.count % 10 {
-        case 1: return "кадр"
-        case 2...4: return "кадра"
-        default: return "кадров"
+        case 1: return "пометка"
+        case 2...4: return "пометки"
+        default: return "пометок"
         }
     }
 
@@ -475,28 +450,6 @@ struct VideoBugMarkupEditor: View {
         }
     }
 
-    private func addMarkerAtPlayhead() {
-        let frameTime = playback.snappedTime(playback.currentTime)
-        playback.seek(to: frameTime)
-
-        if let existing = markers.first(where: {
-            abs($0.time - frameTime) < playback.safeFrameStep / 2
-        }) {
-            selectMarker(existing.id)
-            return
-        }
-
-        let marker = VideoMarkupMarker(
-            id: UUID(),
-            time: frameTime,
-            drawing: PKDrawing()
-        )
-        markers.append(marker)
-        selectedMarkerID = marker.id
-        drawing = marker.drawing
-        UINotificationFeedbackGenerator().notificationOccurred(.success)
-    }
-
     private func togglePlayback() {
         if !playback.isPlaying {
             selectedMarkerID = nil
@@ -513,18 +466,45 @@ struct VideoBugMarkupEditor: View {
     }
 
     private func movePlayhead(to time: Double) {
-        selectedMarkerID = nil
-        drawing = PKDrawing()
-        playback.seek(to: playback.snappedTime(time))
+        let frameTime = playback.snappedTime(time)
+        playback.seek(to: frameTime)
+
+        if let marker = markers.first(where: {
+            abs($0.time - frameTime) < playback.safeFrameStep / 2
+        }) {
+            selectedMarkerID = marker.id
+            drawing = marker.drawing
+        } else {
+            selectedMarkerID = nil
+            drawing = PKDrawing()
+        }
     }
 
     private func updateSelectedMarkerDrawing(_ newDrawing: PKDrawing) {
         playback.pause()
         drawing = newDrawing
 
-        guard let selectedMarkerID,
-              let index = markers.firstIndex(where: { $0.id == selectedMarkerID }) else { return }
-        markers[index].drawing = newDrawing
+        if let selectedMarkerID,
+           let index = markers.firstIndex(where: { $0.id == selectedMarkerID }) {
+            if newDrawing.strokes.isEmpty {
+                markers.remove(at: index)
+                self.selectedMarkerID = nil
+            } else {
+                markers[index].drawing = newDrawing
+            }
+            return
+        }
+
+        guard !newDrawing.strokes.isEmpty else { return }
+        let frameTime = playback.snappedTime(playback.currentTime)
+        let marker = VideoMarkupMarker(
+            id: UUID(),
+            time: frameTime,
+            drawing: newDrawing
+        )
+        markers.append(marker)
+        selectedMarkerID = marker.id
+        UISelectionFeedbackGenerator().selectionChanged()
     }
 
     private func deleteSelectedMarker() {
@@ -550,11 +530,6 @@ struct VideoBugMarkupEditor: View {
         guard playback.isReady, width > 0 else { return }
         let ratio = min(max(x / width, 0), 1)
         movePlayhead(to: Double(ratio) * playback.lastFrameTime)
-    }
-
-    private func stepPlayhead(by frameCount: Int) {
-        movePlayhead(to: playback.currentTime + Double(frameCount) * playback.safeFrameStep)
-        UISelectionFeedbackGenerator().selectionChanged()
     }
 
     private func renderAnnotations() {
@@ -615,11 +590,13 @@ private final class VideoMarkupPlayback: ObservableObject {
 
     private let videoURL: URL
     private var timeObserver: Any?
+    private var endObserver: NSObjectProtocol?
     private var didLoad = false
 
     init(videoURL: URL) {
         self.videoURL = videoURL
-        player = AVPlayer(url: videoURL)
+        player = AVPlayer()
+        player.automaticallyWaitsToMinimizeStalling = true
     }
 
     func load(initialTime: Double) {
@@ -647,10 +624,20 @@ private final class VideoMarkupPlayback: ObservableObject {
         Task { @MainActor in
             do {
                 let asset = AVURLAsset(url: videoURL)
+                let isPlayable = try await asset.load(.isPlayable)
                 let assetDuration = try await asset.load(.duration)
                 let videoTracks = try await asset.loadTracks(withMediaType: .video)
                 let loadedDuration = assetDuration.seconds
                 duration = loadedDuration.isFinite ? max(0, loadedDuration) : 0
+
+                guard isPlayable, duration > 0, !videoTracks.isEmpty else {
+                    isReady = false
+                    return
+                }
+
+                let item = AVPlayerItem(asset: asset)
+                player.replaceCurrentItem(with: item)
+                observePlaybackEnd(for: item)
 
                 if let track = videoTracks.first {
                     let naturalSize = try await track.load(.naturalSize)
@@ -669,7 +656,7 @@ private final class VideoMarkupPlayback: ObservableObject {
                     }
                 }
 
-                isReady = duration > 0
+                isReady = true
                 seek(to: initialTime)
                 await loadTimelineThumbnails(asset: asset)
             } catch {
@@ -694,17 +681,19 @@ private final class VideoMarkupPlayback: ObservableObject {
     }
 
     func togglePlayback() {
-        if isPlaying {
+        guard isReady, player.currentItem != nil else { return }
+
+        if isPlaying || player.timeControlStatus == .playing || player.timeControlStatus == .waitingToPlayAtSpecifiedRate {
             pause()
             return
         }
 
         if duration > 0, currentTime >= lastFrameTime {
-            seek(to: 0)
+            restartPlayback()
+            return
         }
 
-        isPlaying = true
-        player.play()
+        startPlayback()
     }
 
     func pause() {
@@ -720,6 +709,48 @@ private final class VideoMarkupPlayback: ObservableObject {
         if let timeObserver {
             player.removeTimeObserver(timeObserver)
             self.timeObserver = nil
+        }
+
+        if let endObserver {
+            NotificationCenter.default.removeObserver(endObserver)
+            self.endObserver = nil
+        }
+    }
+
+    private func startPlayback() {
+        guard isReady, player.currentItem != nil else { return }
+        isPlaying = true
+        player.playImmediately(atRate: 1)
+    }
+
+    private func restartPlayback() {
+        let start = CMTime.zero
+        currentTime = 0
+        player.currentItem?.cancelPendingSeeks()
+        player.seek(to: start, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
+            Task { @MainActor in
+                guard finished, let self else { return }
+                self.startPlayback()
+            }
+        }
+    }
+
+    private func observePlaybackEnd(for item: AVPlayerItem) {
+        if let endObserver {
+            NotificationCenter.default.removeObserver(endObserver)
+        }
+
+        endObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime,
+            object: item,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                self.player.pause()
+                self.currentTime = self.lastFrameTime
+                self.isPlaying = false
+            }
         }
     }
 
@@ -752,6 +783,215 @@ private final class VideoMarkupPlayback: ObservableObject {
                 thumbnails[index].image = UIImage(cgImage: result.image)
             }
         }
+    }
+}
+
+struct ScreenshotMarkupResult {
+    let image: UIImage
+    let drawing: PKDrawing
+}
+
+@MainActor
+struct ScreenshotMarkupEditor: View {
+    let image: UIImage
+    let existingDrawing: PKDrawing
+    let onCancel: () -> Void
+    let onComplete: (ScreenshotMarkupResult) -> Void
+
+    @State private var drawing: PKDrawing
+    @State private var inkColor = MarkupInkColor.red
+    @State private var canvasCommand: MarkupCanvasCommand?
+    @State private var canvasSize: CGSize = .zero
+    @State private var isDiscardConfirmationPresented = false
+
+    init(
+        image: UIImage,
+        existingDrawing: PKDrawing = PKDrawing(),
+        onCancel: @escaping () -> Void,
+        onComplete: @escaping (ScreenshotMarkupResult) -> Void
+    ) {
+        self.image = image
+        self.existingDrawing = existingDrawing
+        self.onCancel = onCancel
+        self.onComplete = onComplete
+        _drawing = State(initialValue: existingDrawing)
+    }
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 0) {
+                markupToolbar
+
+                GeometryReader { proxy in
+                    let fittedRect = AVMakeRect(
+                        aspectRatio: image.size,
+                        insideRect: CGRect(origin: .zero, size: proxy.size)
+                    )
+
+                    ZStack {
+                        Color.black
+
+                        ZStack {
+                            Image(uiImage: image)
+                                .resizable()
+                                .scaledToFit()
+
+                            MarkupCanvas(
+                                drawing: $drawing,
+                                inkColor: inkColor,
+                                command: canvasCommand,
+                                isEnabled: true,
+                                onDrawingChanged: { drawing = $0 }
+                            )
+                        }
+                        .frame(width: fittedRect.width, height: fittedRect.height)
+                        .onAppear {
+                            canvasSize = fittedRect.size
+                        }
+                        .onChange(of: fittedRect.size) { _, newSize in
+                            canvasSize = newSize
+                        }
+                    }
+                }
+            }
+            .background(Color.black)
+            .navigationTitle("Пометки на снимке")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button(action: requestClose) {
+                        Image(systemName: "xmark")
+                            .font(.body.weight(.semibold))
+                            .frame(width: 44, height: 44)
+                            .background(.regularMaterial, in: Circle())
+                            .contentShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Закрыть")
+                }
+
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button(action: finishEditing) {
+                        Text("Готово")
+                            .fontWeight(.semibold)
+                            .foregroundStyle(Color.white)
+                            .frame(minWidth: 58, minHeight: 32)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .buttonBorderShape(.capsule)
+                    .tint(.blue)
+                    .disabled(canvasSize.width <= 0 || canvasSize.height <= 0)
+                    .accessibilityHint("Сохраняет пометки на снимке")
+                }
+            }
+            .confirmationDialog(
+                "Закрыть редактор?",
+                isPresented: $isDiscardConfirmationPresented,
+                titleVisibility: .visible
+            ) {
+                Button("Удалить изменения", role: .destructive, action: onCancel)
+                Button("Продолжить редактирование", role: .cancel) {}
+            } message: {
+                Text("Несохранённые пометки будут удалены.")
+            }
+        }
+    }
+
+    private var markupToolbar: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 4) {
+                Button {
+                    canvasCommand = MarkupCanvasCommand(kind: .undo)
+                } label: {
+                    Image(systemName: "arrow.uturn.backward")
+                        .frame(width: 44, height: 44)
+                }
+                .disabled(drawing.strokes.isEmpty)
+                .accessibilityLabel("Отменить штрих")
+
+                Button {
+                    canvasCommand = MarkupCanvasCommand(kind: .redo)
+                } label: {
+                    Image(systemName: "arrow.uturn.forward")
+                        .frame(width: 44, height: 44)
+                }
+                .accessibilityLabel("Повторить штрих")
+
+                Button {
+                    canvasCommand = MarkupCanvasCommand(kind: .clear)
+                } label: {
+                    Image(systemName: "eraser.line.dashed")
+                        .frame(width: 44, height: 44)
+                }
+                .disabled(drawing.strokes.isEmpty)
+                .accessibilityLabel("Очистить рисунок")
+
+                Divider()
+                    .frame(height: 26)
+                    .padding(.horizontal, 4)
+
+                ForEach(MarkupInkColor.allCases) { color in
+                    Button {
+                        inkColor = color
+                    } label: {
+                        Circle()
+                            .fill(color.color)
+                            .frame(width: 24, height: 24)
+                            .overlay {
+                                if inkColor == color {
+                                    Image(systemName: "checkmark")
+                                        .font(.caption.bold())
+                                        .foregroundStyle(color == .yellow ? Color.black : Color.white)
+                                }
+                            }
+                            .frame(width: 44, height: 44)
+                    }
+                    .accessibilityLabel(color.accessibilityName)
+                    .accessibilityAddTraits(inkColor == color ? .isSelected : [])
+                }
+            }
+            .padding(.horizontal, 12)
+        }
+        .frame(height: 60)
+        .background(.regularMaterial)
+    }
+
+    private var hasChanges: Bool {
+        drawing.dataRepresentation() != existingDrawing.dataRepresentation()
+    }
+
+    private func requestClose() {
+        if hasChanges {
+            isDiscardConfirmationPresented = true
+        } else {
+            onCancel()
+        }
+    }
+
+    private func finishEditing() {
+        guard canvasSize.width > 0, canvasSize.height > 0 else { return }
+        guard !drawing.strokes.isEmpty else {
+            onComplete(ScreenshotMarkupResult(image: image, drawing: drawing))
+            return
+        }
+
+        let targetSize = CGSize(
+            width: image.size.width * image.scale,
+            height: image.size.height * image.scale
+        )
+        let markupScale = targetSize.width / canvasSize.width
+        let markup = drawing.image(
+            from: CGRect(origin: .zero, size: canvasSize),
+            scale: markupScale
+        )
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = true
+        let renderedImage = UIGraphicsImageRenderer(size: targetSize, format: format).image { _ in
+            image.draw(in: CGRect(origin: .zero, size: targetSize))
+            markup.draw(in: CGRect(origin: .zero, size: targetSize))
+        }
+        onComplete(ScreenshotMarkupResult(image: renderedImage, drawing: drawing))
     }
 }
 

@@ -363,8 +363,11 @@ private struct ActionButton: View {
                 Text(title)
                     .font(.system(size: 13.5, weight: .regular))
                     .foregroundStyle(Color.white.opacity(0.88))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+                    .allowsTightening(true)
             }
-            .frame(width: 60)
+            .frame(width: 80)
         }
         .buttonStyle(.plain)
     }

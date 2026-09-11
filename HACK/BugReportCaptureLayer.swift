@@ -1,5 +1,9 @@
+import AVFoundation
+import AVKit
 import Combine
 import Foundation
+import PencilKit
+import PhotosUI
 import ReplayKit
 import SwiftUI
 import UIKit
@@ -12,12 +16,14 @@ struct BugReportCaptureLayer<Content: View>: View {
     @StateObject private var recorder = BugReportRecorder()
 
     @State private var pendingScreenshot: UIImage?
+    @State private var pendingAdditionalScreenshots: [UIImage] = []
     @State private var isCapturePalettePresented = false
     @State private var reportSession: BugReportSession?
     @State private var isReportPresented = false
     @State private var isReportMinimized = false
     @State private var isReportDiscardPresented = false
     @State private var isWaitingForRecording = false
+    @State private var successToastID: UUID?
 
     private let reporterUsername = "@e.m.usov"
     private let content: Content
@@ -65,6 +71,15 @@ struct BugReportCaptureLayer<Content: View>: View {
                 .padding(.bottom, 84)
                 .transition(.move(edge: .bottom).combined(with: .opacity))
             }
+
+            if successToastID != nil {
+                BugReportSuccessToast()
+                    .padding(.horizontal, 20)
+                    .padding(.top, 68)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .zIndex(10)
+            }
         }
         .animation(reduceMotion ? nil : .easeInOut(duration: 0.22), value: isReportMinimized)
         .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: shouldShowCapturePalette)
@@ -92,7 +107,8 @@ struct BugReportCaptureLayer<Content: View>: View {
                     session: reportSession,
                     username: reporterUsername,
                     onMinimize: minimizeReport,
-                    onClose: closeReport
+                    onClose: closeReport,
+                    onSubmitted: reportDidSubmit
                 )
                 .presentationDetents([.large])
                 .presentationDragIndicator(.visible)
@@ -105,15 +121,20 @@ struct BugReportCaptureLayer<Content: View>: View {
     }
 
     private func handleSystemScreenshot() {
-        guard case .idle = recorder.phase,
-              !isCapturePalettePresented,
-              reportSession == nil else { return }
-
         Task { @MainActor in
-            // UIKit posts the notification after the system has made the screenshot.
             try? await Task.sleep(nanoseconds: 250_000_000)
-            pendingScreenshot = WindowSnapshotter.captureKeyWindow()
-            isCapturePalettePresented = true
+            guard let screenshot = WindowSnapshotter.captureKeyWindow() else { return }
+
+            if let reportSession {
+                reportSession.addScreenshot(screenshot)
+                UINotificationFeedbackGenerator().notificationOccurred(.success)
+            } else if isCapturePalettePresented || recorder.phase.animationValue != 0 {
+                pendingAdditionalScreenshots.append(screenshot)
+                UINotificationFeedbackGenerator().notificationOccurred(.success)
+            } else {
+                pendingScreenshot = screenshot
+                isCapturePalettePresented = true
+            }
         }
     }
 
@@ -124,12 +145,16 @@ struct BugReportCaptureLayer<Content: View>: View {
 
     private func openReport(with attachment: BugReportAttachment?) {
         guard let attachment else { return }
+        let queuedScreenshots = pendingAdditionalScreenshots
         isCapturePalettePresented = false
         pendingScreenshot = nil
+        pendingAdditionalScreenshots = []
 
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 180_000_000)
-            reportSession = BugReportSession(attachment: attachment)
+            let session = BugReportSession(attachment: attachment)
+            queuedScreenshots.forEach(session.addScreenshot)
+            reportSession = session
             isReportMinimized = false
             isReportPresented = true
         }
@@ -182,6 +207,54 @@ struct BugReportCaptureLayer<Content: View>: View {
     private func reportSheetDidDismiss() {
         guard reportSession != nil else { return }
         isReportMinimized = true
+    }
+
+    private func reportDidSubmit() {
+        closeReport()
+        let toastID = UUID()
+        withAnimation(reduceMotion ? nil : .spring(response: 0.32, dampingFraction: 0.86)) {
+            successToastID = toastID
+        }
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 3_800_000_000)
+            guard successToastID == toastID else { return }
+            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.2)) {
+                successToastID = nil
+            }
+        }
+    }
+}
+
+private struct BugReportSuccessToast: View {
+    var body: some View {
+        VStack(spacing: 6) {
+            Image(systemName: "checkmark.circle.fill")
+                .font(.system(size: 34, weight: .semibold))
+                .foregroundStyle(Color.green)
+                .accessibilityHidden(true)
+
+            Text("Баг отправился к разработчикам")
+                .font(.headline)
+                .foregroundStyle(.primary)
+
+            Text("Следить за решением проблемы\nможно в канале ~mb-bugs-prod")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .padding(.horizontal, 22)
+        .padding(.vertical, 18)
+        .frame(maxWidth: 360)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+        }
+        .shadow(color: .black.opacity(0.18), radius: 18, y: 8)
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isStaticText)
     }
 }
 
@@ -321,17 +394,78 @@ private final class BugReportSession: ObservableObject, Identifiable {
 
     let id = UUID()
     @Published var attachment: BugReportAttachment
+    @Published private(set) var screenshots: [BugReportScreenshot] = []
     @Published var comment = ""
+    @Published var category = BugReportCategory.bug
     @Published var stage: Stage
+    private var insertedAnnotationIDs: Set<UUID> = []
 
     init(attachment: BugReportAttachment) {
         self.attachment = attachment
         stage = attachment.isVideo ? .videoMarkup : .report
     }
+
+    var fileURLs: [URL] {
+        attachment.fileURLs + screenshots.map(\.fileURL)
+    }
+
+    func addScreenshot(_ image: UIImage) {
+        guard let screenshot = BugReportScreenshot(image: image) else { return }
+        screenshots.append(screenshot)
+    }
+
+    func applyMarkupToPrimaryScreenshot(_ result: ScreenshotMarkupResult) {
+        guard let updatedAttachment = attachment.adding(screenshotMarkup: result) else { return }
+        let previousURL = attachment.fileURL
+        attachment = updatedAttachment
+        if previousURL != attachment.fileURL {
+            try? FileManager.default.removeItem(at: previousURL)
+        }
+    }
+
+    func applyMarkup(_ result: ScreenshotMarkupResult, to screenshotID: UUID) {
+        guard let index = screenshots.firstIndex(where: { $0.id == screenshotID }),
+              let updatedScreenshot = screenshots[index].adding(markup: result) else { return }
+        let previousURL = screenshots[index].fileURL
+        screenshots[index] = updatedScreenshot
+        if previousURL != updatedScreenshot.fileURL {
+            try? FileManager.default.removeItem(at: previousURL)
+        }
+    }
+
+    func appendAnnotationTimecodesIfNeeded() async {
+        guard attachment.isVideo, !attachment.annotations.isEmpty else { return }
+
+        let asset = AVURLAsset(url: attachment.fileURL)
+        guard let loadedDuration = try? await asset.load(.duration),
+              loadedDuration.seconds.isFinite,
+              loadedDuration.seconds > 10 else { return }
+
+        let newAnnotations = attachment.annotations
+            .filter { !insertedAnnotationIDs.contains($0.id) }
+            .sorted { $0.time < $1.time }
+        guard !newAnnotations.isEmpty else { return }
+
+        let timecodeLines = newAnnotations
+            .map { "\(Self.formattedTime($0.time)) — " }
+            .joined(separator: "\n")
+        let prompt = "Моменты с пометками:\n\(timecodeLines)"
+        comment += comment.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? prompt
+            : "\n\n\(prompt)"
+        insertedAnnotationIDs.formUnion(newAnnotations.map(\.id))
+    }
+
+    private static func formattedTime(_ value: Double) -> String {
+        let clamped = max(0, value.isFinite ? value : 0)
+        return String(format: "%02d:%02d", Int(clamped) / 60, Int(clamped) % 60)
+    }
 }
 
 private struct BugReportIsland: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @ObservedObject var session: BugReportSession
+    @GestureState private var upwardDrag: CGFloat = 0
 
     let onExpand: () -> Void
     let onClose: () -> Void
@@ -383,6 +517,23 @@ private struct BugReportIsland: View {
                 .stroke(Color.primary.opacity(0.1), lineWidth: 1)
         }
         .shadow(color: .black.opacity(0.22), radius: 16, y: 7)
+        .offset(y: reduceMotion ? 0 : upwardDrag * 0.18)
+        .contentShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+        .simultaneousGesture(expandGesture)
+    }
+
+    private var expandGesture: some Gesture {
+        DragGesture(minimumDistance: 10)
+            .updating($upwardDrag) { value, state, _ in
+                state = min(0, value.translation.height)
+            }
+            .onEnded { value in
+                let passedDistance = value.translation.height < -28
+                let passedVelocity = value.predictedEndTranslation.height < -64
+                guard passedDistance || passedVelocity else { return }
+                UISelectionFeedbackGenerator().selectionChanged()
+                onExpand()
+            }
     }
 
     private var summary: String {
@@ -410,6 +561,7 @@ private struct BugReportFlowSheet: View {
     let username: String
     let onMinimize: () -> Void
     let onClose: () -> Void
+    let onSubmitted: () -> Void
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -434,7 +586,7 @@ private struct BugReportFlowSheet: View {
 
             case .report:
                 BugReportSubmissionSheet(
-                    attachment: session.attachment,
+                    session: session,
                     username: username,
                     comment: $session.comment,
                     onEditVideo: session.attachment.isVideo ? {
@@ -443,7 +595,8 @@ private struct BugReportFlowSheet: View {
                         }
                     } : nil,
                     onMinimize: onMinimize,
-                    onDismiss: onClose
+                    onDismiss: onClose,
+                    onSubmitted: onSubmitted
                 )
             }
         }
@@ -460,54 +613,86 @@ private struct BugReportFlowSheet: View {
 }
 
 private struct BugReportSubmissionSheet: View {
-    let attachment: BugReportAttachment
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @ObservedObject var session: BugReportSession
     let username: String
     @Binding var comment: String
     let onEditVideo: (() -> Void)?
     let onMinimize: () -> Void
     let onDismiss: () -> Void
+    let onSubmitted: () -> Void
+
+    @State private var selectedPhotoItems: [PhotosPickerItem] = []
+    @State private var isVideoPreviewPresented = false
+    @State private var screenshotEditTarget: ScreenshotEditTarget?
+    @State private var isKeyboardVisible = false
+
+    private var attachment: BugReportAttachment {
+        session.attachment
+    }
 
     var body: some View {
         NavigationStack {
-            Form {
-                Section("Вложение") {
-                    attachmentPreview
-                }
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 24) {
+                    reportSection("Вложения") {
+                        attachmentPreview
+                    }
 
-                Section("Автор") {
-                    Label(username, systemImage: "person.crop.circle.fill")
-                        .foregroundStyle(.primary)
-                }
+                    reportSection("Автор") {
+                        Label(username, systemImage: "person.crop.circle.fill")
+                            .font(.body)
+                            .foregroundStyle(.primary)
+                            .padding(.horizontal, 16)
+                            .frame(maxWidth: .infinity, minHeight: 56, alignment: .leading)
+                            .background(
+                                Color(uiColor: .secondarySystemGroupedBackground),
+                                in: RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            )
+                    }
 
-                Section("Комментарий") {
-                    ZStack(alignment: .topLeading) {
-                        if comment.isEmpty {
-                            Text("Что произошло?")
-                                .foregroundStyle(.tertiary)
-                                .padding(.top, 8)
-                                .padding(.leading, 5)
-                                .accessibilityHidden(true)
+                    reportSection("Комментарий") {
+                        VStack(alignment: .leading, spacing: 12) {
+                            categoryChips
+
+                            TextField("Что произошло?", text: $comment, axis: .vertical)
+                                .font(.body)
+                                .lineLimit(6...)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .padding(14)
+                                .frame(maxWidth: .infinity, minHeight: 136, alignment: .topLeading)
+                                .background(
+                                    Color(uiColor: .secondarySystemGroupedBackground),
+                                    in: RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                )
+                                .accessibilityLabel("Комментарий к баг-репорту")
                         }
-
-                        TextEditor(text: $comment)
-                            .frame(minHeight: 104)
-                            .accessibilityLabel("Комментарий к баг-репорту")
                     }
                 }
-
-                Section {
-                    ShareLink(
-                        items: attachment.fileURLs,
-                        subject: Text("Баг-репорт от \(username)"),
-                        message: Text(shareMessage)
-                    ) {
-                        Label("Отправить", systemImage: "paperplane.fill")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.blue)
-                    .accessibilityHint("Открывает системное меню для отправки видео и отмеченных кадров")
+                .padding(.horizontal, 16)
+                .padding(.top, 12)
+                .padding(.bottom, 24)
+            }
+            .background(Color(uiColor: .systemGroupedBackground))
+            .scrollDismissesKeyboard(.interactively)
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                if !isKeyboardVisible {
+                    sendBar
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
+            }
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: isKeyboardVisible)
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
+                isKeyboardVisible = true
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
+                isKeyboardVisible = false
+            }
+            .onChange(of: selectedPhotoItems) { _, items in
+                importScreenshots(from: items)
+            }
+            .task(id: attachment.id) {
+                await session.appendAnnotationTimecodesIfNeeded()
             }
             .navigationTitle("Отправить баг-репорт")
             .navigationBarTitleDisplayMode(.inline)
@@ -517,100 +702,442 @@ private struct BugReportSubmissionSheet: View {
                         onDismiss()
                     } label: {
                         Image(systemName: "xmark")
+                            .font(.body.weight(.semibold))
                             .frame(width: 44, height: 44)
+                            .background(.regularMaterial, in: Circle())
+                            .contentShape(Circle())
                     }
+                    .buttonStyle(.plain)
                     .accessibilityLabel("Закрыть")
                 }
 
                 ToolbarItem(placement: .topBarTrailing) {
                     Button(action: onMinimize) {
                         Image(systemName: "chevron.down")
+                            .font(.body.weight(.semibold))
                             .frame(width: 44, height: 44)
+                            .background(.regularMaterial, in: Circle())
+                            .contentShape(Circle())
                     }
+                    .buttonStyle(.plain)
                     .accessibilityLabel("Свернуть баг-репорт")
                 }
             }
         }
+        .fullScreenCover(isPresented: $isVideoPreviewPresented) {
+            VideoPreviewScreen(videoURL: attachment.fileURL)
+        }
+        .fullScreenCover(item: $screenshotEditTarget) { target in
+            ScreenshotMarkupEditor(
+                image: target.image,
+                existingDrawing: target.drawing,
+                onCancel: { screenshotEditTarget = nil },
+                onComplete: { result in
+                    applyScreenshotMarkup(result, to: target.location)
+                    screenshotEditTarget = nil
+                }
+            )
+        }
+    }
+
+    private func reportSection<Content: View>(
+        _ title: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(title)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .padding(.leading, 4)
+
+            content()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     @ViewBuilder
     private var attachmentPreview: some View {
-        switch attachment.kind {
-        case .screenshot(let image):
-            Image(uiImage: image)
-                .resizable()
-                .scaledToFit()
-                .frame(maxHeight: 130)
-                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .accessibilityLabel("Снимок экрана")
+        VStack(alignment: .leading, spacing: 12) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(alignment: .top, spacing: 12) {
+                    switch attachment.kind {
+                    case .screenshot(let image):
+                        screenshotCard(
+                            image: image,
+                            title: "Снимок 1",
+                            action: editPrimaryScreenshot
+                        )
 
-        case .video:
-            VStack(alignment: .leading, spacing: 12) {
-                Label(
-                    attachment.annotations.isEmpty ? "Запись экрана" : "Видео с пометками",
-                    systemImage: "video.fill"
-                )
-                    .foregroundStyle(.primary)
-
-                if !attachment.annotations.isEmpty {
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(alignment: .top, spacing: 10) {
-                            ForEach(Array(attachment.annotations.enumerated()), id: \.element.id) { index, annotation in
-                                VStack(alignment: .leading, spacing: 6) {
-                                    Image(uiImage: annotation.preview)
-                                        .resizable()
-                                        .scaledToFit()
-                                        .frame(width: 150, height: 150)
-                                        .background(Color.black)
-                                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-
-                                    Text("\(index + 1) · \(formattedTime(annotation.time))")
-                                        .font(.caption.monospacedDigit())
-                                        .foregroundStyle(.secondary)
-                                }
-                                .accessibilityElement(children: .ignore)
-                                .accessibilityLabel("Отмеченный кадр \(index + 1) на \(formattedTime(annotation.time))")
-                            }
-                        }
+                    case .video:
+                        VideoAttachmentPreviewCard(
+                            videoURL: attachment.fileURL,
+                            annotations: attachment.annotations,
+                            action: { isVideoPreviewPresented = true }
+                        )
                     }
 
-                    Label(
-                        "\(attachment.annotations.count) \(attachment.markerCountWord)",
-                        systemImage: "pencil.and.outline"
-                    )
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                }
+                    ForEach(Array(session.screenshots.enumerated()), id: \.element.id) { index, screenshot in
+                        screenshotCard(
+                            image: screenshot.image,
+                            title: "Снимок \(index + (attachment.isVideo ? 1 : 2))",
+                            action: { editScreenshot(screenshot) }
+                        )
+                    }
 
-                if let onEditVideo {
-                    Button("Изменить пометки", action: onEditVideo)
+                    PhotosPicker(
+                        selection: $selectedPhotoItems,
+                        maxSelectionCount: 20,
+                        matching: .images
+                    ) {
+                        VStack(spacing: 10) {
+                            Image(systemName: "plus")
+                                .font(.title.bold())
+
+                            Text("Добавить файл")
+                                .font(.headline)
+                                .multilineTextAlignment(.center)
+                        }
+                        .foregroundStyle(Color.blue)
+                        .frame(width: 156, height: 278)
+                        .background(Color(uiColor: .secondarySystemBackground))
+                        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Добавить снимок")
+                    .accessibilityHint("Открывает медиатеку для выбора изображений")
                 }
+            }
+
+            if attachment.isVideo, let onEditVideo {
+                Button("Изменить пометки", action: onEditVideo)
             }
         }
     }
 
-    private var shareMessage: String {
-        var parts = [username]
+    private func screenshotCard(
+        image: UIImage,
+        title: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 8) {
+                ZStack(alignment: .bottomTrailing) {
+                    Image(uiImage: image)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 156, height: 242)
+                        .background(Color.black)
 
-        if !comment.isEmpty {
-            parts.append(comment)
+                    Image(systemName: "pencil")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Color.white)
+                        .frame(width: 32, height: 32)
+                        .background(.regularMaterial, in: Circle())
+                        .padding(8)
+                }
+
+                Text(title)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 10)
+            }
+            .frame(width: 156, height: 278, alignment: .topLeading)
+            .background(Color(uiColor: .secondarySystemBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         }
-
-        if !attachment.annotations.isEmpty {
-            let moments = attachment.annotations
-                .map { formattedTime($0.time) }
-                .joined(separator: ", ")
-            parts.append("Отмеченные моменты: \(moments)")
-        }
-
-        return parts.joined(separator: "\n\n")
+        .buttonStyle(.plain)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(title), изменить пометки")
     }
 
-    private func formattedTime(_ value: Double) -> String {
-        let clamped = max(0, value)
-        let minutes = Int(clamped) / 60
-        let seconds = clamped.truncatingRemainder(dividingBy: 60)
-        return String(format: "%02d:%04.1f", minutes, seconds)
+    private var sendBar: some View {
+        Button(action: onSubmitted) {
+            Text("Отправить")
+                .font(.headline)
+                .foregroundStyle(Color.white)
+                .frame(maxWidth: .infinity, minHeight: 44)
+        }
+        .buttonStyle(.borderedProminent)
+        .buttonBorderShape(.capsule)
+        .controlSize(.large)
+        .tint(.blue)
+        .accessibilityHint("Отправляет баг-репорт разработчикам")
+        .padding(.horizontal, 20)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity)
+        .background(.regularMaterial)
+    }
+
+    private var categoryChips: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(BugReportCategory.allCases) { category in
+                    Button {
+                        session.category = category
+                    } label: {
+                        Text(category.title)
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(session.category == category ? Color.white : Color.primary)
+                            .padding(.horizontal, 16)
+                            .frame(minHeight: 44)
+                            .background(
+                                session.category == category
+                                    ? Color.blue
+                                    : Color(uiColor: .secondarySystemBackground),
+                                in: Capsule()
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityAddTraits(session.category == category ? .isSelected : [])
+                }
+            }
+        }
+        .accessibilityLabel("Категория баг-репорта")
+    }
+
+    private func editPrimaryScreenshot() {
+        guard let image = attachment.editingScreenshotImage else { return }
+        screenshotEditTarget = ScreenshotEditTarget(
+            location: .primary,
+            image: image,
+            drawing: attachment.screenshotDrawing ?? PKDrawing()
+        )
+    }
+
+    private func editScreenshot(_ screenshot: BugReportScreenshot) {
+        screenshotEditTarget = ScreenshotEditTarget(
+            location: .supplemental(screenshot.id),
+            image: screenshot.sourceImage,
+            drawing: screenshot.drawing ?? PKDrawing()
+        )
+    }
+
+    private func applyScreenshotMarkup(
+        _ result: ScreenshotMarkupResult,
+        to location: ScreenshotEditTarget.Location
+    ) {
+        switch location {
+        case .primary:
+            session.applyMarkupToPrimaryScreenshot(result)
+        case .supplemental(let screenshotID):
+            session.applyMarkup(result, to: screenshotID)
+        }
+    }
+
+    private func importScreenshots(from items: [PhotosPickerItem]) {
+        guard !items.isEmpty else { return }
+
+        Task { @MainActor in
+            for item in items {
+                guard let data = try? await item.loadTransferable(type: Data.self),
+                      let image = UIImage(data: data) else { continue }
+                session.addScreenshot(image)
+            }
+            selectedPhotoItems = []
+        }
+    }
+}
+
+private enum BugReportCategory: String, CaseIterable, Identifiable {
+    case bug
+    case badExperience
+    case advertising
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .bug: "Нашёлся баг"
+        case .badExperience: "Плохой опыт"
+        case .advertising: "Реклама"
+        }
+    }
+}
+
+private struct ScreenshotEditTarget: Identifiable {
+    enum Location {
+        case primary
+        case supplemental(UUID)
+    }
+
+    let id = UUID()
+    let location: Location
+    let image: UIImage
+    let drawing: PKDrawing
+}
+
+private struct VideoAttachmentPreviewCard: View {
+    let videoURL: URL
+    let annotations: [VideoFrameAnnotation]
+    let action: () -> Void
+
+    @State private var poster: UIImage?
+
+    var body: some View {
+        Button(action: action) {
+            ZStack {
+                Color.black
+
+                if let poster {
+                    Image(uiImage: poster)
+                        .resizable()
+                        .scaledToFit()
+                } else {
+                    ProgressView()
+                        .tint(.white)
+                }
+
+                Circle()
+                    .fill(.regularMaterial)
+                    .frame(width: 52, height: 52)
+                    .overlay {
+                        Image(systemName: "play.fill")
+                            .font(.title3.weight(.semibold))
+                            .foregroundStyle(Color.white)
+                            .offset(x: 1)
+                    }
+                    .shadow(color: .black.opacity(0.25), radius: 8, y: 3)
+
+                VStack {
+                    Spacer()
+
+                    HStack(spacing: 6) {
+                        Image(systemName: annotations.isEmpty ? "video.fill" : "pencil.and.outline")
+
+                        Text(annotations.isEmpty ? "Видео" : "\(annotations.count) \(markerCountWord)")
+                            .lineLimit(1)
+                    }
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Color.white)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 9)
+                    .background(.ultraThinMaterial)
+                }
+            }
+            .frame(width: 156, height: 278)
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+            }
+        }
+        .buttonStyle(.plain)
+        .task(id: videoURL) {
+            poster = await loadPoster()
+        }
+        .accessibilityLabel(annotations.isEmpty ? "Открыть видео" : "Открыть видео с \(annotations.count) пометками")
+        .accessibilityHint("Открывает полноэкранный системный видеоплеер")
+    }
+
+    private func loadPoster() async -> UIImage? {
+        let asset = AVURLAsset(url: videoURL)
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: 468, height: 834)
+        generator.requestedTimeToleranceBefore = CMTime(seconds: 0.1, preferredTimescale: 600)
+        generator.requestedTimeToleranceAfter = CMTime(seconds: 0.1, preferredTimescale: 600)
+        let requestedTime = CMTime(seconds: 0, preferredTimescale: 600)
+        guard let result = try? await generator.image(at: requestedTime) else { return nil }
+        return UIImage(cgImage: result.image)
+    }
+
+    private var markerCountWord: String {
+        let value = annotations.count % 100
+        if (11...14).contains(value) { return "пометок" }
+
+        switch annotations.count % 10 {
+        case 1: return "пометка"
+        case 2...4: return "пометки"
+        default: return "пометок"
+        }
+    }
+}
+
+private struct VideoPreviewScreen: View {
+    let videoURL: URL
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var player = AVPlayer()
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            Color.black
+                .ignoresSafeArea()
+
+            VideoPlayer(player: player)
+                .ignoresSafeArea(edges: .horizontal)
+
+            Button(action: dismiss.callAsFunction) {
+                Image(systemName: "xmark")
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(Color.white)
+                    .frame(width: 44, height: 44)
+                    .background(.regularMaterial, in: Circle())
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .padding(.leading, 16)
+            .padding(.top, 10)
+            .accessibilityLabel("Закрыть видео")
+        }
+        .onAppear {
+            player.replaceCurrentItem(with: AVPlayerItem(url: videoURL))
+            player.play()
+        }
+        .onDisappear {
+            player.pause()
+            player.replaceCurrentItem(with: nil)
+        }
+    }
+}
+
+private struct BugReportScreenshot: Identifiable {
+    let id: UUID
+    let image: UIImage
+    let fileURL: URL
+    let sourceImage: UIImage
+    let drawing: PKDrawing?
+
+    init?(image: UIImage) {
+        self.init(
+            id: UUID(),
+            image: image,
+            sourceImage: image,
+            drawing: nil
+        )
+    }
+
+    private init?(
+        id: UUID,
+        image: UIImage,
+        sourceImage: UIImage,
+        drawing: PKDrawing?
+    ) {
+        guard let data = image.pngData() else { return nil }
+        let outputURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("bug-report-screenshot-\(UUID().uuidString)")
+            .appendingPathExtension("png")
+
+        do {
+            try data.write(to: outputURL, options: .atomic)
+            self.id = id
+            self.image = image
+            fileURL = outputURL
+            self.sourceImage = sourceImage
+            self.drawing = drawing
+        } catch {
+            return nil
+        }
+    }
+
+    func adding(markup: ScreenshotMarkupResult) -> BugReportScreenshot? {
+        BugReportScreenshot(
+            id: id,
+            image: markup.image,
+            sourceImage: sourceImage,
+            drawing: markup.drawing
+        )
     }
 }
 
@@ -625,6 +1152,8 @@ private struct BugReportAttachment: Identifiable {
     let fileURL: URL
     let annotations: [VideoFrameAnnotation]
     let sourceVideoURL: URL?
+    let sourceScreenshot: UIImage?
+    let screenshotDrawing: PKDrawing?
 
     var isVideo: Bool {
         if case .video = kind { return true }
@@ -632,21 +1161,26 @@ private struct BugReportAttachment: Identifiable {
     }
 
     var fileURLs: [URL] {
-        [fileURL] + annotations.map(\.fileURL)
+        [fileURL]
     }
 
     var editingVideoURL: URL {
         sourceVideoURL ?? fileURL
     }
 
+    var editingScreenshotImage: UIImage? {
+        guard case .screenshot = kind else { return nil }
+        return sourceScreenshot
+    }
+
     var markerCountWord: String {
         let value = annotations.count % 100
-        if (11...14).contains(value) { return "отмеченных кадров" }
+        if (11...14).contains(value) { return "пометок" }
 
         switch annotations.count % 10 {
-        case 1: return "отмеченный кадр"
-        case 2...4: return "отмеченных кадра"
-        default: return "отмеченных кадров"
+        case 1: return "пометка"
+        case 2...4: return "пометки"
+        default: return "пометок"
         }
     }
 
@@ -662,6 +1196,8 @@ private struct BugReportAttachment: Identifiable {
             fileURL = url
             annotations = []
             sourceVideoURL = nil
+            sourceScreenshot = screenshot
+            screenshotDrawing = nil
         } catch {
             return nil
         }
@@ -672,6 +1208,8 @@ private struct BugReportAttachment: Identifiable {
         fileURL = url
         annotations = []
         sourceVideoURL = url
+        sourceScreenshot = nil
+        screenshotDrawing = nil
     }
 
     private init(
@@ -683,6 +1221,31 @@ private struct BugReportAttachment: Identifiable {
         fileURL = url
         self.annotations = annotations
         self.sourceVideoURL = sourceVideoURL
+        sourceScreenshot = nil
+        screenshotDrawing = nil
+    }
+
+    private init?(
+        screenshot: UIImage,
+        sourceScreenshot: UIImage,
+        drawing: PKDrawing
+    ) {
+        guard let data = screenshot.pngData() else { return nil }
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("bug-report-\(UUID().uuidString)")
+            .appendingPathExtension("png")
+
+        do {
+            try data.write(to: url, options: .atomic)
+            kind = .screenshot(screenshot)
+            fileURL = url
+            annotations = []
+            sourceVideoURL = nil
+            self.sourceScreenshot = sourceScreenshot
+            screenshotDrawing = drawing
+        } catch {
+            return nil
+        }
     }
 
     func adding(
@@ -697,6 +1260,15 @@ private struct BugReportAttachment: Identifiable {
             videoAt: annotatedVideoURL,
             sourceVideoURL: sourceURL,
             annotations: annotations
+        )
+    }
+
+    func adding(screenshotMarkup: ScreenshotMarkupResult) -> BugReportAttachment? {
+        guard let sourceScreenshot else { return nil }
+        return BugReportAttachment(
+            screenshot: screenshotMarkup.image,
+            sourceScreenshot: sourceScreenshot,
+            drawing: screenshotMarkup.drawing
         )
     }
 }
